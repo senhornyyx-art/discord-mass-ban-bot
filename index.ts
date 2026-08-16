@@ -1,150 +1,238 @@
-import * as Discord from 'discord.js'
-const client = new Discord.Client()
+import {
+	Client,
+	GatewayIntentBits,
+	Events,
+	PermissionsBitField,
+	ChatInputCommandInteraction,
+	TextChannel,
+	GuildMember,
+} from "discord.js";
 
-const serverId = getRequiredEnvironmentVariable('DISCORD_SERVER_ID')
-const joinLogChannelId = getRequiredEnvironmentVariable('DISCORD_JOIN_LOG_CHANNEL_ID')
-const adminChannelId = getRequiredEnvironmentVariable('DISCORD_ADMIN_CHANNEL_ID')
-const botAuthToken = getRequiredEnvironmentVariable('DISCORD_BOT_AUTH_TOKEN')
+const TOKEN = process.env.DISCORD_BOT_AUTH_TOKEN;
 
-const startTime = new Date();
-let lastJoinTime = startTime
-let consecutiveJoins = 0
-
-function RaidCheck(serverId: string) {
-	const adminChannel = getChannel(serverId, adminChannelId)
-
-	const currentTime = new Date();
-	const elapsedTime = currentTime.getTime() - lastJoinTime.getTime()
-
-	console.log(`cuurent time = ` + currentTime.getTime())
-
-	const timeDiff = elapsedTime / 1000;
-
-	// get seconds
-	const seconds = Math.round(timeDiff);
-	console.log(`elapsed time = ` + seconds + " seconds");
-
-	if (seconds < 30) {
-		consecutiveJoins++
-		console.log(`I saw a consectutive join`)
-
-		if (consecutiveJoins > 3) {
-			console.log(`I saw more than 3 consecutive joins!!`)
-			adminChannel.send(`RUN FOR COVER - A MASS DM SPAMBOT MIGHT BE JOINING OUR SERVER!`)
-			adminChannel.send(`Can someone monitor the welcome channel and ban these accounts? format is: "ban [WelcomeMessageIDStart] [WelcomeMessageIDEnd]"`)
-		}
-	} else {
-		console.log(`Re-setting join detector` + consecutiveJoins)
-		consecutiveJoins = 0
-	}
-
-	lastJoinTime = currentTime
-
-	return
+if (!TOKEN) {
+	console.error("DISCORD_BOT_AUTH_TOKEN não foi definido.");
+	process.exit(1);
 }
 
-client.on('ready', () => {
-	// This event will run if the bot starts, and logs in, successfully.
-	if (client.user === null) throw new Error(`Client doesn't have a user.`)
-	console.log(`Bot has started, with ${client.users.cache.size} users, in ${client.channels.cache.size} channels of ${client.guilds.cache.size} servers.`)
-	client.user.setActivity(`watchdog`)
-})
+const client = new Client({
+	intents: [
+		GatewayIntentBits.Guilds,
+		GatewayIntentBits.GuildMembers,
+		GatewayIntentBits.GuildMessages,
+		GatewayIntentBits.MessageContent,
+	],
+});
 
-client.on('guildCreate', (guild) => {
-	// This event triggers when the bot joins a server.
-	console.log(`New server joined: ${guild.name} (id: ${guild.id}). This server has ${guild.memberCount} members!`)
-})
+// Membros detectados recentemente em cada servidor
+const recentJoins = new Map<
+	string,
+	Map<string, number>
+>();
 
-client.on('guildMemberAdd', (member) => {
-	console.log('Triggered member add')
+const lastJoin = new Map<string, number>();
+const consecutiveJoins = new Map<string, number>();
 
-	RaidCheck(member.guild.id)
-})
+const RAID_WINDOW = 30_000;
+const BAN_WINDOW = 5 * 60_000;
 
-client.on("message", async maybeCommand => {
+client.once(Events.ClientReady, (bot) => {
+	console.log(`Bot conectado como ${bot.user.tag}`);
+	bot.user.setActivity("watchdog");
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+	const guildId = member.guild.id;
+	const now = Date.now();
+
+	if (!recentJoins.has(guildId)) {
+		recentJoins.set(guildId, new Map());
+	}
+
+	const joins = recentJoins.get(guildId)!;
+
+	joins.set(member.id, now);
+
+	// Remove entradas antigas
+	for (const [userId, timestamp] of joins) {
+		if (now - timestamp > BAN_WINDOW) {
+			joins.delete(userId);
+		}
+	}
+
+	const previous = lastJoin.get(guildId) ?? 0;
+	const count = consecutiveJoins.get(guildId) ?? 0;
+
+	if (now - previous < RAID_WINDOW) {
+		consecutiveJoins.set(guildId, count + 1);
+	} else {
+		consecutiveJoins.set(guildId, 1);
+	}
+
+	lastJoin.set(guildId, now);
+
+	const consecutive =
+		consecutiveJoins.get(guildId) ?? 0;
+
+	if (consecutive > 3) {
+		console.log(
+			`Possível raid detectada em ${member.guild.name}: ${consecutive} entradas consecutivas.`
+		);
+	}
+});
+
+client.on(Events.MessageCreate, async (message) => {
 	try {
-		const commandServer = maybeCommand.guild
-		if (commandServer === null) return
-		if (commandServer.id !== serverId) return
-		console.log(`Noticed message in server ${commandServer.id} channel ${maybeCommand.channel.id}: ${maybeCommand}`)
-		if (maybeCommand.channel.id !== joinLogChannelId) return
+		if (!message.guild) return;
+		if (message.author.bot) return;
 
-		const regex = maybeCommand.content.match(/^ban (\d+?) (\d+?)$/i)
-		if (regex === null) return
+		const content = message.content.trim().toLowerCase();
 
-		const joinLogChannel = getChannel(commandServer.id, joinLogChannelId)
-		const toBan: Discord.Message[] = []
-		let currentMessageId = BigInt(regex[1]) > BigInt(regex[2]) ? BigInt(regex[1]) : BigInt(regex[2])
-		const lastMessageId = BigInt(regex[1]) < BigInt(regex[2]) ? BigInt(regex[1]) : BigInt(regex[2])
-		console.log(`Banning everyone from message ID ${lastMessageId} to ${currentMessageId}`)
-		let doneCollecting = false;
-		while (!doneCollecting) {
-			const messages = await joinLogChannel.messages.fetch({ limit: 50, before: (currentMessageId + 1n).toString(10) })
-			messages.forEach(message => {
-				const messageId = BigInt(message.id)
-				if (message.type !== 'GUILD_MEMBER_JOIN') return
-				if (messageId < lastMessageId) return (doneCollecting = true)
-				toBan.push(message)
-				currentMessageId = BigInt(message.id)
-			});
+		if (content !== "ban all") return;
+
+		// Apenas quem pode banir membros pode executar
+		if (
+			!message.member?.permissions.has(
+				PermissionsBitField.Flags.BanMembers
+			)
+		) {
+			await message.reply(
+				"❌ Você não tem permissão para usar esse comando."
+			);
+			return;
 		}
 
-		console.log('The people to ban...!')
-		console.log(toBan.map(message => message.author.username));
+		const joins =
+			recentJoins.get(message.guild.id);
 
-		const firstBannedMessage = toBan[toBan.length - 1]
-		const lastBannedMessage = toBan[0]
-		const banTimeRange = Math.abs(lastBannedMessage.createdAt.getTime() - firstBannedMessage.createdAt.getTime())
-		if (banTimeRange > 5 * 60 * 1000) {
-			await maybeCommand.channel.send({ content: `You can only ban over a a 5 minute range, and the two selected messages span a ${banTimeRange / 1000 / 60} minute range.` })
-			return
+		if (!joins || joins.size === 0) {
+			await message.reply(
+				"❌ Não há membros recentes detectados para banir."
+			);
+			return;
 		}
-		const confirmationMessage = await maybeCommand.channel.send({ content: `Are you sure? You are going to ban ${toBan.length} users who joined from ${firstBannedMessage.author.username}#${firstBannedMessage.author.discriminator} (\`${firstBannedMessage.createdAt.toUTCString()}\`) ${lastBannedMessage.author.username}#${lastBannedMessage.author.discriminator} to (\`${lastBannedMessage.createdAt.toUTCString()}\`)` })
-		const allReactions = await confirmationMessage.awaitReactions(reaction => ["👍"].includes(reaction.emoji.name), { max: 1, time: 60000, errors: ["time"] })
-		const reaction = allReactions.first();
-		console.log('reaction parsed')
-		if (!reaction) return
 
-		console.log(reaction.emoji.name)
-		if (!reaction || reaction.emoji.name !== "👍") return
+		const now = Date.now();
 
-		for (const userMessage of toBan) {
-			console.log(`Banning: ${userMessage.author.username}#${userMessage.author.discriminator} (${userMessage.author.id})`)
+		const recentUserIds = [...joins.entries()]
+			.filter(
+				([, timestamp]) =>
+					now - timestamp <= BAN_WINDOW
+			)
+			.map(([userId]) => userId);
+
+		if (recentUserIds.length === 0) {
+			await message.reply(
+				"❌ Não há membros recentes detectados para banir."
+			);
+			return;
+		}
+
+		const confirmation = await message.reply(
+			`⚠️ **Confirmação de raid**\n\n` +
+			`Foram detectados **${recentUserIds.length} membros** que entraram nos últimos 5 minutos.\n\n` +
+			`Reaja com 👍 nesta mensagem para confirmar o banimento.\n` +
+			`A confirmação expira em 60 segundos.`
+		);
+
+		await confirmation.react("👍");
+
+		const filter = (
+			reaction: any,
+			user: any
+		) =>
+			reaction.emoji.name === "👍" &&
+			user.id === message.author.id;
+
+		let reactions;
+
+		try {
+			reactions =
+				await confirmation.awaitReactions({
+					filter,
+					max: 1,
+					time: 60_000,
+					errors: ["time"],
+				});
+		} catch {
+			await message.channel.send(
+				"❌ Tempo de confirmação expirado. Operação cancelada."
+			);
+			return;
+		}
+
+		if (!reactions.first()) return;
+
+		let banned = 0;
+		let failed = 0;
+
+		for (const userId of recentUserIds) {
 			try {
-				await commandServer.members.ban(userMessage.author.id, { days: 7, reason: "Join raid." })
-			} catch (error: unknown) {
-				console.log(`Failed to ban ${userMessage.author.username}#${userMessage.author.discriminator} (${userMessage.author.id}): ${error instanceof Error ? error.message : error}`)
+				const member =
+					await message.guild.members.fetch(
+						userId
+					).catch(() => null);
+
+				if (!member) {
+					failed++;
+					continue;
+				}
+
+				// Nunca tenta banir o próprio bot ou um membro
+				// que esteja acima do bot na hierarquia
+				if (
+					member.id === client.user?.id ||
+					!member.bannable
+				) {
+					failed++;
+					continue;
+				}
+
+				await member.ban({
+					deleteMessageSeconds:
+						7 * 24 * 60 * 60,
+					reason: "Join raid.",
+				});
+
+				banned++;
+			} catch (error) {
+				failed++;
+
+				console.error(
+					`Falha ao banir ${userId}:`,
+					error
+				);
 			}
 		}
-	} catch (error: unknown) {
-		await maybeCommand.channel.send({ content: `No 👍 reaction received after 1 minute, ban cancelled (or possibly some other error, Discord doesn't have good error reporting).  ${error instanceof Error ? error.message : error}` })
-		console.error(error)
+
+		// Limpa os membros que foram processados
+		for (const userId of recentUserIds) {
+			joins.delete(userId);
+		}
+
+		await message.channel.send(
+			`✅ **Operação concluída!**\n\n` +
+			`🔨 Banidos: **${banned}**\n` +
+			`❌ Falhas: **${failed}**`
+		);
+	} catch (error) {
+		console.error(
+			"Erro no comando:",
+			error
+		);
 	}
-})
+});
 
-client.login(botAuthToken)
-
-function getChannel(serverId: string, channelId: string) {
-	const server = client.guilds.cache.get(serverId)
-	if (server === undefined) throw new Error(`Bot not joined to server.`)
-	const channel = server.channels.cache.find(channel => channel.id === channelId)
-	if (!(channel instanceof Discord.TextChannel)) throw new Error(`Join log channel is not a text channel.`)
-	return channel
-}
+client.on(Events.Error, (error) => {
+	console.error("Discord error:", error);
+});
 
 function exit() {
-	client.destroy()
-	process.exit(0)
+	client.destroy();
+	process.exit(0);
 }
 
-function getRequiredEnvironmentVariable(name: string) {
-	const value = process.env[name]
-	if (value === undefined) {
-		console.error(`${name} environment variable is required.`)
-		process.exit(1)
-	}
-	return value
-}
+process.on("SIGTERM", exit);
+process.on("SIGINT", exit);
 
-process.on('SIGTERM', exit)
-process.on('SIGINT', exit)
+client.login(TOKEN);
